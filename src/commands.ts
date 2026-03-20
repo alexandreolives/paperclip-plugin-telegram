@@ -14,7 +14,8 @@ export const BOT_COMMANDS: BotCommand[] = [
   { command: "agents", description: "List agents with current status" },
   { command: "approve", description: "Approve a pending request by ID" },
   { command: "help", description: "Show available commands" },
-  { command: "acp", description: "Manage ACP coding agent sessions (spawn, status, cancel, close)" },
+  { command: "acp", description: "Manage agent sessions (spawn, status, cancel, close)" },
+  { command: "commands", description: "Manage custom workflow commands (list, import, run, delete)" },
 ];
 
 export async function handleCommand(

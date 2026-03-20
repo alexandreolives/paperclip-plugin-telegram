@@ -24,17 +24,19 @@ import {
 } from "./formatters.js";
 import { handleCommand, getTopicForProject, BOT_COMMANDS } from "./commands.js";
 import {
-  routeMessageToAcp,
-  handleAcpOutput,
+  routeMessageToAgent,
   handleHandoffToolCall,
   handleDiscussToolCall,
   handleHandoffApproval,
   handleHandoffRejection,
+  setupAcpOutputListener,
 } from "./acp-bridge.js";
+import { handleMediaMessage } from "./media-pipeline.js";
+import { handleCommandsCommand, tryCustomCommand } from "./command-registry.js";
+import { handleRegisterWatch, checkWatches } from "./watch-registry.js";
 import { METRIC_NAMES } from "./constants.js";
-import { TelegramAdapter } from "./adapter.js";
 import { EscalationManager } from "./escalation.js";
-import type { EscalationEvent, EscalationResponse } from "./escalation.js";
+import type { EscalationEvent } from "./escalation.js";
 
 type TelegramConfig = {
   telegramBotTokenRef: string;
@@ -55,6 +57,13 @@ type TelegramConfig = {
   escalationTimeoutMs: number;
   escalationDefaultAction: "defer" | "auto_reply" | "close";
   escalationHoldMessage: string;
+  // Phase 3: Media Pipeline
+  briefAgentId: string;
+  briefAgentChatIds: string[];
+  transcriptionApiKeyRef: string;
+  // Phase 5: Proactive Suggestions
+  maxSuggestionsPerHourPerCompany: number;
+  watchDeduplicationWindowMs: number;
 };
 
 type TelegramUpdate = {
@@ -71,6 +80,13 @@ type TelegramUpdate = {
       from?: { is_bot?: boolean };
     };
     entities?: Array<{ type: string; offset: number; length: number }>;
+    // Media fields (Phase 3)
+    voice?: { file_id: string; duration: number; mime_type?: string };
+    audio?: { file_id: string; duration: number; title?: string; mime_type?: string };
+    video_note?: { file_id: string; duration: number };
+    document?: { file_id: string; file_name?: string; mime_type?: string };
+    photo?: Array<{ file_id: string; width: number; height: number }>;
+    caption?: string;
   };
   callback_query?: {
     id: string;
@@ -99,6 +115,14 @@ async function resolveChat(
   return (override as string) ?? fallback ?? null;
 }
 
+async function resolveCompanyId(ctx: PluginContext, chatId: string): Promise<string> {
+  const mapping = await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: `chat_${chatId}`,
+  }) as { companyName: string } | null;
+  return mapping?.companyName ?? chatId;
+}
+
 const plugin = definePlugin({
   async setup(ctx) {
     const rawConfig = await ctx.config.get();
@@ -115,7 +139,11 @@ const plugin = definePlugin({
 
     // --- Register bot commands with Telegram ---
     if (config.enableCommands) {
-      const registered = await setMyCommands(ctx, token, BOT_COMMANDS);
+      const allCommands = [
+        ...BOT_COMMANDS,
+        { command: "commands", description: "Manage custom workflow commands" },
+      ];
+      const registered = await setMyCommands(ctx, token, allCommands);
       if (registered) {
         ctx.logger.info("Bot commands registered with Telegram");
       }
@@ -150,17 +178,18 @@ const plugin = definePlugin({
       }
     }
 
-    // Start polling in background
     if (config.enableCommands || config.enableInbound) {
       pollUpdates().catch((err) =>
         ctx.logger.error("Polling loop crashed", { error: String(err) }),
       );
     }
 
-    // Stop polling on plugin shutdown
     ctx.events.on("plugin.stopping", async () => {
       pollingActive = false;
     });
+
+    // --- Phase 2: ACP output listener (cross-plugin events) ---
+    setupAcpOutputListener(ctx, token);
 
     // --- Event subscriptions ---
 
@@ -177,7 +206,6 @@ const plugin = definePlugin({
       if (!chatId) return;
       const msg = formatter(event);
 
-      // Topic routing: check if event has a project mapping
       let messageThreadId: number | undefined;
       if (config.topicRouting) {
         const payload = event.payload as Record<string, unknown>;
@@ -292,16 +320,16 @@ const plugin = definePlugin({
 
           const dateStr = new Date().toISOString().split("T")[0];
           const lines = [
-            escapeMarkdownV2("📊") + ` *Daily Digest \\- ${escapeMarkdownV2(dateStr!)}*`,
+            escapeMarkdownV2("\ud83d\udcca") + ` *Daily Digest \\- ${escapeMarkdownV2(dateStr!)}*`,
             "",
-            `${escapeMarkdownV2("✅")} Tasks completed: *${completedToday.length}*`,
-            `${escapeMarkdownV2("📋")} Tasks created: *${createdToday.length}*`,
-            `${escapeMarkdownV2("🤖")} Active agents: *${activeAgents.length}*/${escapeMarkdownV2(String(agents.length))}`,
+            `${escapeMarkdownV2("\u2705")} Tasks completed: *${completedToday.length}*`,
+            `${escapeMarkdownV2("\ud83d\udccb")} Tasks created: *${createdToday.length}*`,
+            `${escapeMarkdownV2("\ud83e\udd16")} Active agents: *${activeAgents.length}*/${escapeMarkdownV2(String(agents.length))}`,
           ];
 
           if (activeAgents.length > 0) {
             const topAgent = activeAgents[0]!.name;
-            lines.push(`${escapeMarkdownV2("⭐")} Top performer: *${escapeMarkdownV2(topAgent)}*`);
+            lines.push(`${escapeMarkdownV2("\u2b50")} Top performer: *${escapeMarkdownV2(topAgent)}*`);
           }
 
           await sendMessage(ctx, token, config.defaultChatId, lines.join("\n"), {
@@ -310,7 +338,7 @@ const plugin = definePlugin({
         } catch (err) {
           ctx.logger.error("Daily digest failed", { error: String(err) });
           const text = [
-            escapeMarkdownV2("📊") + " *Daily Digest*",
+            escapeMarkdownV2("\ud83d\udcca") + " *Daily Digest*",
             "",
             escapeMarkdownV2("Could not generate digest. Check plugin logs for details."),
           ].join("\n");
@@ -322,43 +350,12 @@ const plugin = definePlugin({
       });
     }
 
-    // --- ACP output listener ---
-    ctx.events.on("acp:output", async (event: unknown) => {
-      const acpEvent = event as {
-        sessionId: string;
-        chatId: string;
-        threadId: number;
-        text: string;
-        done?: boolean;
-      };
-      await handleAcpOutput(ctx, token, acpEvent);
-    });
-
-    // --- Escalation support ---
-    const adapter = new TelegramAdapter(ctx, token);
+    // --- Phase 1: Escalation support ---
     const escalationManager = new EscalationManager();
 
-    ctx.events.on("escalation.created", async (event: unknown) => {
-      const escalationEvent = event as EscalationEvent;
-      if (!config.escalationChatId) {
-        ctx.logger.warn("Escalation received but no escalationChatId configured");
-        return;
-      }
-      await escalationManager.create(ctx, token, escalationEvent, config.escalationChatId);
-
-      // Send hold message to the originating chat if configured
-      if (config.escalationHoldMessage && escalationEvent.originChatId) {
-        const holdText = escapeMarkdownV2(config.escalationHoldMessage);
-        await sendMessage(ctx, token, escalationEvent.originChatId, holdText, {
-          parseMode: "MarkdownV2",
-          messageThreadId: escalationEvent.originThreadId ? Number(escalationEvent.originThreadId) : undefined,
-          replyToMessageId: escalationEvent.originMessageId ? Number(escalationEvent.originMessageId) : undefined,
-        });
-      }
-    });
-
-    // --- Register escalate_to_human tool ---
+    // Register escalate_to_human tool - 3-arg signature with ToolRunContext
     ctx.tools.register("escalate_to_human", {
+      displayName: "Escalate to Human",
       description: "Escalate a conversation to a human when you cannot handle it confidently",
       parametersSchema: {
         type: "object",
@@ -387,40 +384,66 @@ const plugin = definePlugin({
             maximum: 1,
             description: "How confident the agent is (0-1). Lower values indicate greater need for human help",
           },
+          originChatId: { type: "string" },
+          originThreadId: { type: "string" },
+          originMessageId: { type: "string" },
+          sessionId: { type: "string", description: "Session ID for routing reply back" },
+          transport: { type: "string", enum: ["native", "acp"], description: "Transport type for reply routing" },
         },
         required: ["reason", "conversationSummary"],
       },
-    }, async (params: Record<string, unknown>) => {
+    }, async (params: unknown, runCtx) => {
+      const p = params as Record<string, unknown>;
       const escalationId = crypto.randomUUID();
       const timeoutMs = config.escalationTimeoutMs || 900000;
       const defaultAction = config.escalationDefaultAction || "defer";
 
-      await ctx.events.emit("escalation.created", {
+      if (!config.escalationChatId) {
+        ctx.logger.warn("Escalation received but no escalationChatId configured");
+        return { error: "No escalation channel configured" };
+      }
+
+      const escalationEvent: EscalationEvent = {
         escalationId,
-        agentId: String(params.agentId ?? "unknown-agent"),
-        companyId: String(params.companyId ?? ""),
-        reason: params.reason,
+        agentId: runCtx.agentId,
+        companyId: runCtx.companyId,
+        reason: p.reason as EscalationEvent["reason"],
         context: {
           conversationHistory: [],
-          agentReasoning: String(params.conversationSummary ?? ""),
-          suggestedActions: (params.suggestedActions as string[]) ?? [],
-          suggestedReply: params.suggestedReply ? String(params.suggestedReply) : undefined,
-          confidenceScore: typeof params.confidenceScore === "number" ? params.confidenceScore : undefined,
+          agentReasoning: String(p.conversationSummary ?? ""),
+          suggestedActions: (p.suggestedActions as string[]) ?? [],
+          suggestedReply: p.suggestedReply ? String(p.suggestedReply) : undefined,
+          confidenceScore: typeof p.confidenceScore === "number" ? p.confidenceScore : undefined,
         },
         timeout: {
           durationMs: timeoutMs,
           defaultAction,
         },
-        originChatId: params.originChatId ? String(params.originChatId) : undefined,
-        originThreadId: params.originThreadId ? String(params.originThreadId) : undefined,
-        originMessageId: params.originMessageId ? String(params.originMessageId) : undefined,
-      } satisfies EscalationEvent);
+        originChatId: p.originChatId ? String(p.originChatId) : undefined,
+        originThreadId: p.originThreadId ? String(p.originThreadId) : undefined,
+        originMessageId: p.originMessageId ? String(p.originMessageId) : undefined,
+        transport: p.transport as "native" | "acp" | undefined,
+        sessionId: p.sessionId ? String(p.sessionId) : undefined,
+      };
+
+      await escalationManager.create(ctx, token, escalationEvent, config.escalationChatId);
+
+      // Send hold message to the originating chat if configured
+      if (config.escalationHoldMessage && escalationEvent.originChatId) {
+        const holdText = escapeMarkdownV2(config.escalationHoldMessage);
+        await sendMessage(ctx, token, escalationEvent.originChatId, holdText, {
+          parseMode: "MarkdownV2",
+          messageThreadId: escalationEvent.originThreadId ? Number(escalationEvent.originThreadId) : undefined,
+          replyToMessageId: escalationEvent.originMessageId ? Number(escalationEvent.originMessageId) : undefined,
+        });
+      }
 
       return { content: JSON.stringify({ status: "escalated", escalationId }) };
     });
 
-    // --- Register handoff_to_agent tool ---
+    // --- Phase 2: Register handoff_to_agent tool ---
     ctx.tools.register("handoff_to_agent", {
+      displayName: "Handoff to Agent",
       description: "Hand off work to another agent in this thread",
       parametersSchema: {
         type: "object",
@@ -429,15 +452,18 @@ const plugin = definePlugin({
           reason: { type: "string", description: "Why you're handing off" },
           contextSummary: { type: "string", description: "Summary for the target agent" },
           requiresApproval: { type: "boolean", default: true, description: "Wait for human approval before target starts" },
+          chatId: { type: "string", description: "Telegram chat ID" },
+          threadId: { type: "number", description: "Telegram thread ID" },
         },
         required: ["targetAgent", "reason", "contextSummary"],
       },
-    }, async (params: Record<string, unknown>) => {
-      return handleHandoffToolCall(ctx, token, params);
+    }, async (params: unknown, runCtx) => {
+      return handleHandoffToolCall(ctx, token, params as Record<string, unknown>, runCtx.companyId, runCtx.agentId);
     });
 
-    // --- Register discuss_with_agent tool ---
+    // --- Phase 2: Register discuss_with_agent tool ---
     ctx.tools.register("discuss_with_agent", {
+      displayName: "Discuss with Agent",
       description: "Start a back-and-forth conversation with another agent",
       parametersSchema: {
         type: "object",
@@ -447,14 +473,50 @@ const plugin = definePlugin({
           initialMessage: { type: "string", description: "First message to send" },
           maxTurns: { type: "number", default: 10, description: "Maximum conversation turns" },
           humanCheckpointAt: { type: "number", description: "Pause for human approval at this turn" },
+          chatId: { type: "string", description: "Telegram chat ID" },
+          threadId: { type: "number", description: "Telegram thread ID" },
         },
         required: ["targetAgent", "topic", "initialMessage"],
       },
-    }, async (params: Record<string, unknown>) => {
-      return handleDiscussToolCall(ctx, token, params);
+    }, async (params: unknown, runCtx) => {
+      return handleDiscussToolCall(ctx, token, params as Record<string, unknown>, runCtx.companyId, runCtx.agentId);
     });
 
-    // --- Escalation timeout checker job ---
+    // --- Phase 5: Register register_watch tool ---
+    ctx.tools.register("register_watch", {
+      displayName: "Register Watch",
+      description: "Register a proactive watch that monitors entities and sends suggestions",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          name: { type: "string", description: "Name of the watch" },
+          description: { type: "string", description: "What this watch monitors" },
+          entityType: { type: "string", enum: ["issue", "agent", "company", "custom"], description: "Type of entity to watch" },
+          conditions: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                field: { type: "string" },
+                operator: { type: "string", enum: ["gt", "lt", "eq", "ne", "contains", "exists"] },
+                value: {},
+              },
+              required: ["field", "operator", "value"],
+            },
+            description: "Conditions that trigger the watch",
+          },
+          template: { type: "string", description: "Message template with {{field}} placeholders" },
+          builtinTemplate: { type: "string", enum: ["invoice-overdue", "lead-stale"], description: "Use a built-in template instead" },
+          chatId: { type: "string", description: "Telegram chat ID for suggestions" },
+          threadId: { type: "number", description: "Telegram thread ID for suggestions" },
+        },
+        required: ["chatId"],
+      },
+    }, async (params: unknown, runCtx) => {
+      return handleRegisterWatch(ctx, params as Record<string, unknown>, runCtx.companyId);
+    });
+
+    // --- Phase 1: Escalation timeout checker job ---
     ctx.jobs.register("check-escalation-timeouts", async () => {
       try {
         await escalationManager.checkTimeouts(ctx, token);
@@ -463,7 +525,19 @@ const plugin = definePlugin({
       }
     });
 
-    ctx.logger.info("Telegram bot plugin started");
+    // --- Phase 5: Watch checker job ---
+    ctx.jobs.register("check-watches", async () => {
+      try {
+        await checkWatches(ctx, token, {
+          maxSuggestionsPerHourPerCompany: config.maxSuggestionsPerHourPerCompany ?? 10,
+          watchDeduplicationWindowMs: config.watchDeduplicationWindowMs ?? 86400000,
+        });
+      } catch (err) {
+        ctx.logger.error("Watch check failed", { error: String(err) });
+      }
+    });
+
+    ctx.logger.info("Telegram bot plugin started (Chat OS v2 - all 5 phases)");
   },
 
   async onValidateConfig(config) {
@@ -494,18 +568,34 @@ async function handleUpdate(
   }
 
   const msg = update.message;
-  if (!msg?.text) return;
+  if (!msg) return;
 
   const chatId = String(msg.chat.id);
-  const text = msg.text;
   const threadId = msg.message_thread_id;
 
-  // Route thread messages to ACP if a session is bound
+  // Phase 3: Handle media messages
+  const hasMedia = !!(msg.voice || msg.audio || msg.video_note || msg.document || msg.photo);
+  if (hasMedia) {
+    const companyId = await resolveCompanyId(ctx, chatId);
+    const handled = await handleMediaMessage(ctx, token, msg as Parameters<typeof handleMediaMessage>[2], {
+      briefAgentId: config.briefAgentId ?? "",
+      briefAgentChatIds: config.briefAgentChatIds ?? [],
+      transcriptionApiKeyRef: config.transcriptionApiKeyRef ?? "",
+    }, companyId);
+    if (handled) return;
+  }
+
+  if (!msg.text) return;
+
+  const text = msg.text;
+
+  // Route thread messages to agent sessions
   if (threadId) {
-    const isAcpCommand = text.startsWith("/acp");
-    if (!isAcpCommand) {
+    const isCommand = text.startsWith("/");
+    if (!isCommand) {
+      const companyId = await resolveCompanyId(ctx, chatId);
       const replyToId = msg.reply_to_message?.message_id;
-      const routed = await routeMessageToAcp(ctx, chatId, threadId, text, replyToId);
+      const routed = await routeMessageToAgent(ctx, token, chatId, threadId, text, replyToId, companyId);
       if (routed) return;
     }
   }
@@ -515,6 +605,18 @@ async function handleUpdate(
     const fullCommand = text.slice(botCommand.offset, botCommand.offset + botCommand.length);
     const command = fullCommand.replace(/^\//, "").replace(/@.*$/, "");
     const args = text.slice(botCommand.offset + botCommand.length).trim();
+    const companyId = await resolveCompanyId(ctx, chatId);
+
+    // Phase 4: Check custom commands first
+    if (command === "commands") {
+      await handleCommandsCommand(ctx, token, chatId, args, threadId, companyId);
+      return;
+    }
+
+    const handledCustom = await tryCustomCommand(ctx, token, chatId, command, args, threadId, companyId);
+    if (handledCustom) return;
+
+    // Built-in commands
     await handleCommand(ctx, token, chatId, command, args, threadId, baseUrl);
     return;
   }
@@ -600,7 +702,7 @@ async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("✅")} *Approved* by ${escapeMarkdownV2(actor)}`,
+          `${escapeMarkdownV2("\u2705")} *Approved* by ${escapeMarkdownV2(actor)}`,
           { parseMode: "MarkdownV2" },
         );
       }
@@ -612,7 +714,6 @@ async function handleCallbackQuery(
 
   if (data.startsWith("esc_")) {
     const parts = data.split("_");
-    // Format: esc_{action}_{escalationId}
     const action = parts[1] ?? "";
     const escalationId = parts.slice(2).join("_");
     const escalationManager = new EscalationManager();
@@ -652,7 +753,7 @@ async function handleCallbackQuery(
           token,
           chatId,
           messageId,
-          `${escapeMarkdownV2("❌")} *Rejected* by ${escapeMarkdownV2(actor)}`,
+          `${escapeMarkdownV2("\u274c")} *Rejected* by ${escapeMarkdownV2(actor)}`,
           { parseMode: "MarkdownV2" },
         );
       }

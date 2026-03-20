@@ -3,3 +3,4 @@ export { TelegramAdapter } from "./adapter.js";
 export type { PlatformAdapter, MessageRef, ActionButton, SendOpts } from "./adapter.js";
 export { EscalationManager } from "./escalation.js";
 export type { EscalationEvent, EscalationResponse, EscalationReason } from "./escalation.js";
+export type { ChatSession } from "./acp-bridge.js";

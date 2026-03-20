@@ -1,6 +1,5 @@
 import type { PluginContext } from "@paperclipai/plugin-sdk";
 import { sendMessage, editMessage, escapeMarkdownV2, truncateAtWord } from "./telegram-api.js";
-import type { TelegramAdapter, MessageRef } from "./adapter.js";
 
 export type EscalationReason =
   | "low_confidence"
@@ -27,6 +26,9 @@ export type EscalationEvent = {
   originChatId?: string;
   originThreadId?: string;
   originMessageId?: string;
+  // Transport info for routing replies back
+  transport?: "native" | "acp";
+  sessionId?: string;
 };
 
 export type EscalationResponse = {
@@ -54,6 +56,8 @@ type StoredEscalation = {
   createdAt: string;
   timeoutAt: string;
   defaultAction: "defer" | "auto_reply" | "close";
+  transport?: "native" | "acp";
+  sessionId?: string;
 };
 
 const REASON_LABELS: Record<EscalationReason, string> = {
@@ -111,6 +115,7 @@ export class EscalationManager {
     }
     buttons.push([
       { text: "Reply", callback_data: `esc_reply_${event.escalationId}` },
+      { text: "Override", callback_data: `esc_override_${event.escalationId}` },
       { text: "Dismiss", callback_data: `esc_dismiss_${event.escalationId}` },
     ]);
 
@@ -144,6 +149,8 @@ export class EscalationManager {
       createdAt: new Date().toISOString(),
       timeoutAt,
       defaultAction: event.timeout.defaultAction,
+      transport: event.transport,
+      sessionId: event.sessionId,
     };
 
     await ctx.state.set(
@@ -211,15 +218,13 @@ export class EscalationManager {
         break;
       }
       case "reply": {
-        // Mark as "awaiting reply" - the next reply-to-message in the escalation chat
-        // will be routed through the respond() path
         if (chatId && messageId) {
           await editMessage(
             ctx,
             token,
             chatId,
             messageId,
-            `${esc("\u26a0\ufe0f")} *Escalation* \\- *Awaiting your reply*\n\n${esc("Reply to this message with your response to the customer\\.")}`,
+            `${esc("\u26a0\ufe0f")} *Escalation* \\- *Awaiting your reply*\n\n${esc("Reply to this message with your response to the customer.")}`,
             { parseMode: "MarkdownV2" },
           );
         }
@@ -235,14 +240,13 @@ export class EscalationManager {
         break;
       }
       case "override": {
-        // Same as reply - user will reply to the message
         if (chatId && messageId) {
           await editMessage(
             ctx,
             token,
             chatId,
             messageId,
-            `${esc("\u26a0\ufe0f")} *Escalation* \\- *Override mode*\n\n${esc("Reply to this message with your custom response\\.")}`,
+            `${esc("\u26a0\ufe0f")} *Escalation* \\- *Override mode*\n\n${esc("Reply to this message with your custom response.")}`,
             { parseMode: "MarkdownV2" },
           );
         }
@@ -282,10 +286,8 @@ export class EscalationManager {
       stored,
     );
 
-    // Remove from pending list
     await this.removePending(ctx, stored.escalationId);
 
-    // Update the escalation message
     const statusLabel = response.action === "dismiss" ? "Dismissed" : "Resolved";
     await editMessage(
       ctx,
@@ -296,24 +298,45 @@ export class EscalationManager {
       { parseMode: "MarkdownV2" },
     );
 
-    // Emit resolution event so the agent can continue
-    ctx.events.emit("escalation.resolved", {
+    // Route reply back via the correct transport
+    if (response.action === "reply_to_customer" && response.responseText) {
+      if (stored.transport === "native" && stored.sessionId) {
+        // Route back through native agent session
+        try {
+          await ctx.agents.sessions.sendMessage(stored.sessionId, stored.companyId, {
+            prompt: `[Human escalation response] ${response.responseText}`,
+            reason: "escalation_reply",
+          });
+        } catch (err) {
+          ctx.logger.error("Failed to route escalation reply to native session", { error: String(err) });
+        }
+      } else if (stored.transport === "acp" && stored.sessionId) {
+        // Route back via ACP event
+        ctx.events.emit("acp-spawn", stored.companyId, {
+          type: "message",
+          sessionId: stored.sessionId,
+          text: `[Human escalation response] ${response.responseText}`,
+        });
+      }
+
+      // Also send to the originating Telegram chat if available
+      if (stored.originChatId) {
+        await sendMessage(ctx, token, stored.originChatId, esc(response.responseText), {
+          parseMode: "MarkdownV2",
+          messageThreadId: stored.originThreadId ? Number(stored.originThreadId) : undefined,
+          replyToMessageId: stored.originMessageId ? Number(stored.originMessageId) : undefined,
+        });
+      }
+    }
+
+    // Emit resolution event - companyId is SECOND arg
+    ctx.events.emit("escalation.resolved", stored.companyId, {
       escalationId: stored.escalationId,
       agentId: stored.agentId,
-      companyId: stored.companyId,
       responderId: response.responderId,
       responseText: response.responseText,
       action: response.action,
     });
-
-    // If there's a response to send back to the original chat, send it
-    if (response.action === "reply_to_customer" && response.responseText && stored.originChatId) {
-      await sendMessage(ctx, token, stored.originChatId, esc(response.responseText), {
-        parseMode: "MarkdownV2",
-        messageThreadId: stored.originThreadId ? Number(stored.originThreadId) : undefined,
-        replyToMessageId: stored.originMessageId ? Number(stored.originMessageId) : undefined,
-      });
-    }
 
     ctx.logger.info("Escalation resolved", {
       escalationId: stored.escalationId,
@@ -356,7 +379,6 @@ export class EscalationManager {
 
       await this.removePending(ctx, escalationId);
 
-      // Update escalation message
       await editMessage(
         ctx,
         token,
@@ -366,16 +388,14 @@ export class EscalationManager {
         { parseMode: "MarkdownV2" },
       );
 
-      // Emit timeout event
-      ctx.events.emit("escalation.timed_out", {
+      // Emit timeout event - companyId is SECOND arg
+      ctx.events.emit("escalation.timed_out", stored.companyId, {
         escalationId,
         agentId: stored.agentId,
-        companyId: stored.companyId,
         defaultAction: stored.defaultAction,
         suggestedReply: stored.suggestedReply,
       });
 
-      // If default action is auto_reply and there's a suggested reply, send it
       if (stored.defaultAction === "auto_reply" && stored.suggestedReply && stored.originChatId) {
         await sendMessage(ctx, token, stored.originChatId, esc(stored.suggestedReply), {
           parseMode: "MarkdownV2",

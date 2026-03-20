@@ -1,5 +1,5 @@
 export const PLUGIN_ID = "paperclip-plugin-telegram";
-export const PLUGIN_VERSION = "0.1.0";
+export const PLUGIN_VERSION = "0.2.0";
 
 export const DEFAULT_CONFIG = {
   telegramBotTokenRef: "",
@@ -20,6 +20,13 @@ export const DEFAULT_CONFIG = {
   escalationTimeoutMs: 900000,
   escalationDefaultAction: "defer",
   escalationHoldMessage: "Let me check on that - I'll get back to you shortly.",
+  // Phase 3: Media Pipeline
+  briefAgentId: "",
+  briefAgentChatIds: [] as string[],
+  transcriptionApiKeyRef: "",
+  // Phase 5: Proactive Suggestions
+  maxSuggestionsPerHourPerCompany: 10,
+  watchDeduplicationWindowMs: 86400000, // 24h
 } as const;
 
 export const MAX_AGENTS_PER_THREAD = 5;
@@ -34,4 +41,11 @@ export const METRIC_NAMES = {
   escalationsCreated: "telegram_escalations_created",
   escalationsResolved: "telegram_escalations_resolved",
   escalationsTimedOut: "telegram_escalations_timed_out",
+  mediaProcessed: "telegram_media_processed",
+  commandsExecuted: "telegram_custom_commands_executed",
+  suggestionsEmitted: "telegram_suggestions_emitted",
 } as const;
+
+// Cross-plugin ACP event names
+export const ACP_SPAWN_EVENT = "acp-spawn";
+export const ACP_OUTPUT_EVENT = "plugin.paperclip-plugin-acp.output";
