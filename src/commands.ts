@@ -269,8 +269,7 @@ async function handleConnect(
   const match = companies.find(
     (c) =>
       c.id === input ||
-      c.name?.toLowerCase() === input.toLowerCase() ||
-      c.shortname?.toLowerCase() === input.toLowerCase(),
+      c.name?.toLowerCase() === input.toLowerCase(),
   );
 
   if (!match) {
