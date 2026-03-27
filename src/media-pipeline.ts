@@ -167,42 +167,38 @@ async function transcribeAudio(
   fileId: string,
   transcriptionApiKeyRef: string,
 ): Promise<string | null> {
-  // 1. Get file path from Telegram
+  // 1. Get file path from Telegram (JSON response — ctx.http.fetch works fine for this)
   const fileRes = await ctx.http.fetch(
     `${TELEGRAM_API}/bot${botToken}/getFile?file_id=${fileId}`,
     { method: "GET" },
   );
-  const fileData = (await fileRes.json()) as {
-    ok: boolean;
-    result?: { file_path: string };
-  };
-
+  const fileData = (await fileRes.json()) as { ok: boolean; result?: { file_path?: string } };
   if (!fileData.ok || !fileData.result?.file_path) {
     ctx.logger.error("Failed to get file path from Telegram", { fileId });
     return null;
   }
 
-  // 2. Download the file
+  // 2. Download binary audio using native fetch (bypasses RPC bridge UTF-8 corruption)
   const downloadUrl = `${TELEGRAM_API}/file/bot${botToken}/${fileData.result.file_path}`;
-  const audioRes = await ctx.http.fetch(downloadUrl, { method: "GET" });
-  const audioBlob = await audioRes.blob();
+  const audioRes = await fetch(downloadUrl);
+  const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
 
-  // 3. Send to Whisper API
+  // 3. Resolve the OpenAI API key from Paperclip secrets
   const apiKey = await ctx.secrets.resolve(transcriptionApiKeyRef);
+
+  // 4. Build multipart form data manually (native FormData + Blob works in Node 18+)
   const formData = new FormData();
-  formData.append("file", audioBlob, "audio.ogg");
+  formData.append("file", new Blob([audioBuffer], { type: "audio/ogg" }), "audio.ogg");
   formData.append("model", "whisper-1");
 
-  const whisperRes = await ctx.http.fetch(
-    "https://api.openai.com/v1/audio/transcriptions",
-    {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${apiKey}`,
-      },
-      body: formData,
+  // 5. Send to Whisper API using native fetch (FormData can't be serialized through RPC bridge)
+  const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
     },
-  );
+    body: formData,
+  });
 
   const whisperData = (await whisperRes.json()) as { text?: string };
   return whisperData.text ?? null;
