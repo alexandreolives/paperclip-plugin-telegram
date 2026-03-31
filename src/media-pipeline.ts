@@ -56,7 +56,7 @@ export async function handleMediaMessage(
   let textContent = msg.caption ?? "";
 
   // Transcribe audio/voice if applicable
-  if (isAudio && config.transcriptionApiKeyRef) {
+  if (isAudio) {
     try {
       const transcription = await transcribeAudio(ctx, token, fileId, config.transcriptionApiKeyRef);
       if (transcription) {
@@ -172,43 +172,44 @@ async function transcribeAudio(
   ctx: PluginContext,
   botToken: string,
   fileId: string,
-  transcriptionApiKeyRef: string,
+  _transcriptionApiKeyRef: string,
 ): Promise<string | null> {
-  // 1. Get file path from Telegram (JSON response — ctx.http.fetch works fine for this)
-  const fileRes = await ctx.http.fetch(
-    `${TELEGRAM_API}/bot${botToken}/getFile?file_id=${fileId}`,
-    { method: "GET" },
-  );
+  const { execSync } = await import("child_process");
+  const path = await import("path");
+  const os = await import("os");
+  const fs = await import("fs");
+
+  // 1. Get file path from Telegram
+  const fileRes = await ctx.http.fetch(`${TELEGRAM_API}/bot${botToken}/getFile?file_id=${fileId}`, { method: "GET" });
   const fileData = (await fileRes.json()) as { ok: boolean; result?: { file_path?: string } };
   if (!fileData.ok || !fileData.result?.file_path) {
     ctx.logger.error("Failed to get file path from Telegram", { fileId });
     return null;
   }
 
-  // 2. Download binary audio using native fetch (bypasses RPC bridge UTF-8 corruption)
+  // 2. Download audio
   const downloadUrl = `${TELEGRAM_API}/file/bot${botToken}/${fileData.result.file_path}`;
   const audioRes = await fetch(downloadUrl);
   const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
 
-  // 3. Resolve the OpenAI API key from Paperclip secrets
-  const apiKey = await ctx.secrets.resolve(transcriptionApiKeyRef);
+  // 3. Save to temp file
+  const tmpDir = os.tmpdir();
+  const tmpFile = path.join(tmpDir, `telegram-voice-${Date.now()}.ogg`);
+  fs.writeFileSync(tmpFile, audioBuffer);
 
-  // 4. Build multipart form data manually (native FormData + Blob works in Node 18+)
-  const formData = new FormData();
-  formData.append("file", new Blob([audioBuffer], { type: "audio/ogg" }), "audio.ogg");
-  formData.append("model", "whisper-1");
-
-  // 5. Send to Whisper API using native fetch (FormData can't be serialized through RPC bridge)
-  const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-    method: "POST",
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-    },
-    body: formData,
-  });
-
-  const whisperData = (await whisperRes.json()) as { text?: string };
-  return whisperData.text ?? null;
+  // 4. Run whisper CLI locally
+  try {
+    execSync(`whisper "${tmpFile}" --model base --language fr --output_format txt --output_dir "${tmpDir}"`, { timeout: 60000 });
+    const txtFile = tmpFile.replace(".ogg", ".txt");
+    const text = fs.readFileSync(txtFile, "utf8").trim();
+    try { fs.unlinkSync(tmpFile); fs.unlinkSync(txtFile); } catch {}
+    ctx.logger.info("Local whisper transcription OK", { length: text.length });
+    return text || null;
+  } catch (err) {
+    ctx.logger.error("Local whisper transcription failed", { error: String(err) });
+    try { fs.unlinkSync(tmpFile); } catch {}
+    return null;
+  }
 }
 
 function buildBriefPrompt(msg: TelegramMediaMessage, textContent: string): string {

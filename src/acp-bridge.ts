@@ -177,7 +177,12 @@ async function handleAcpSpawn(
   let agentId = "";
 
   try {
-    const agent = await ctx.agents.get(trimmedName, resolvedCompanyId);
+    const allAgents = await ctx.agents.list({ companyId: resolvedCompanyId });
+    const agent = allAgents.find((a: any) =>
+      a.name?.toLowerCase() === trimmedName.toLowerCase() ||
+      a.urlKey?.toLowerCase() === trimmedName.toLowerCase() ||
+      a.role?.toLowerCase() === trimmedName.toLowerCase()
+    );
     if (agent) {
       // Native Paperclip agent - create a session
       agentId = agent.id;
@@ -510,31 +515,30 @@ export async function routeMessageToAgent(
   // Route via correct transport
   if (targetSession.transport === "native") {
     try {
-      await ctx.agents.sessions.sendMessage(targetSession.sessionId, resolvedCompanyId, {
-        prompt: text,
-        reason: "telegram_message",
-        onEvent: (event: AgentSessionEvent) => {
-          if (event.eventType === "chunk" && event.message) {
-            handleAcpOutput(ctx, token, {
-              sessionId: targetSession!.sessionId,
-              chatId,
-              threadId,
-              text: event.message,
-              done: false,
-            }).catch((err) => ctx.logger.error("Native output handler error", { error: String(err) }));
-          } else if (event.eventType === "done") {
-            handleAcpOutput(ctx, token, {
-              sessionId: targetSession!.sessionId,
-              chatId,
-              threadId,
-              text: event.message ?? "",
-              done: true,
-            }).catch((err) => ctx.logger.error("Native output handler error", { error: String(err) }));
-          }
-        },
+      const baseUrl = process.env.PAPERCLIP_API_URL || "http://127.0.0.1:3100";
+      const issueRes = await ctx.http.fetch(`${baseUrl}/api/companies/${resolvedCompanyId}/issues`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          title: `[Telegram] ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`,
+          description: `Message via Telegram:\n\n${text}`,
+          status: "todo",
+          assigneeAgentId: targetSession.agentId,
+          priority: "high",
+        }),
+      });
+      const issue = (await issueRes.json()) as { id: string; identifier?: string };
+      ctx.logger.info("Created Paperclip issue from Telegram", { issueId: issue.id, agentId: targetSession.agentId });
+      await ctx.http.fetch(`${baseUrl}/api/agents/${targetSession.agentId}/wakeup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "telegram_message", taskId: issue.id }),
+      });
+      await sendMessage(ctx, token, chatId, escapeMarkdownV2(`📋 Issue ${issue.identifier || "?"} créée. L'agent va répondre.`), {
+        messageThreadId: threadId,
       });
     } catch (err) {
-      ctx.logger.error("Failed to send message to native session", { error: String(err) });
+      ctx.logger.error("Failed to create issue from Telegram", { error: String(err) });
       return false;
     }
   } else {
