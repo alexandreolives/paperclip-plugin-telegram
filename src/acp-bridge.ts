@@ -177,21 +177,30 @@ async function handleAcpSpawn(
   let agentId = "";
 
   try {
-    const agent = await ctx.agents.get(trimmedName, resolvedCompanyId);
+    // Resolve agent via REST API — ctx.agents.get expects UUID but users pass name/urlKey
+    const _baseUrl = process.env.PAPERCLIP_API_URL || "http://127.0.0.1:3100";
+    let agent: { id: string; name: string } | null = null;
+    try {
+      const res = await fetch(`${_baseUrl}/api/agents/${encodeURIComponent(trimmedName.toLowerCase())}?companyId=${resolvedCompanyId}`);
+      if (res.ok) agent = (await res.json()) as typeof agent;
+    } catch {}
+    if (!agent) {
+      try {
+        const res2 = await fetch(`${_baseUrl}/api/agents/${encodeURIComponent(trimmedName)}?companyId=${resolvedCompanyId}`);
+        if (res2.ok) agent = (await res2.json()) as typeof agent;
+      } catch {}
+    }
     if (agent) {
-      // Native Paperclip agent - create a session
+      // Agent found — use native transport via issue routing
       agentId = agent.id;
-      const session = await ctx.agents.sessions.create(agentId, resolvedCompanyId, {
-        reason: `Telegram thread ${chatId}/${messageThreadId}`,
-      });
-      sessionId = session.sessionId;
+      sessionId = `native_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       transport = "native";
-      ctx.logger.info("Created native agent session", { agentId, sessionId });
+      ctx.logger.info("Agent matched for native transport", { agentId, agentName: agent.name });
     } else {
       sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     }
   } catch {
-    // Agent not found in Paperclip - fall back to ACP
+    // Fall back to ACP
     sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   }
 
