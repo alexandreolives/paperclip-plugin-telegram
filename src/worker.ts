@@ -31,6 +31,7 @@ import {
   handleHandoffApproval,
   handleHandoffRejection,
   setupAcpOutputListener,
+  findSessionChatsByIssueId,
 } from "./acp-bridge.js";
 import { handleMediaMessage } from "./media-pipeline.js";
 import { handleCommandsCommand, tryCustomCommand } from "./command-registry.js";
@@ -280,6 +281,46 @@ const plugin = definePlugin({
         await notify(event, formatIssueDone);
       });
     }
+
+    // --- Bridge retour: agent comments on conversation → Telegram ---
+    ctx.events.on("issue.commented", async (event: PluginEvent) => {
+      try {
+        const payload = event.payload as Record<string, unknown>;
+        const issueId = String(event.entityId ?? payload.issueId ?? "");
+        const commentBody = String(payload.body ?? payload.comment ?? "");
+        const authorAgentId = String(payload.authorAgentId ?? "");
+
+        // Only forward agent comments (not user/telegram comments)
+        if (!authorAgentId || !commentBody || !issueId) return;
+
+        // Find active sessions that reference this issue
+        const chatIds = await findSessionChatsByIssueId(ctx, issueId);
+        if (chatIds.length === 0) return;
+
+        // Resolve agent name
+        let agentName = "Agent";
+        try {
+          const agent = await ctx.agents.get(authorAgentId, event.companyId);
+          if (agent) agentName = agent.name;
+        } catch {}
+
+        // Send to all matching Telegram threads
+        for (const { chatId: targetChatId, threadId: targetThreadId } of chatIds) {
+          const truncated = commentBody.length > 3800
+            ? commentBody.slice(0, 3800) + "\n\n[...tronqué]"
+            : commentBody;
+          await sendMessage(
+            ctx,
+            token,
+            targetChatId,
+            `${escapeMarkdownV2("🤖")} *\\[${escapeMarkdownV2(agentName)}\\]*\n\n${escapeMarkdownV2(truncated)}`,
+            { parseMode: "MarkdownV2", messageThreadId: targetThreadId },
+          );
+        }
+      } catch (err) {
+        ctx.logger.error("Failed to bridge agent comment to Telegram", { error: String(err) });
+      }
+    });
 
     if (config.notifyOnApprovalCreated) {
       ctx.events.on("approval.created", async (event: PluginEvent) => {

@@ -179,21 +179,25 @@ async function handleAcpSpawn(
   let agentId = "";
 
   try {
-    const allAgents = await ctx.agents.list({ companyId: resolvedCompanyId });
-    const agent = allAgents.find((a: any) =>
-      a.name?.toLowerCase() === trimmedName.toLowerCase() ||
-      a.urlKey?.toLowerCase() === trimmedName.toLowerCase() ||
-      a.role?.toLowerCase() === trimmedName.toLowerCase()
-    );
+    // Resolve agent via REST API (ctx.agents.get expects UUID, REST supports urlKey)
+    const baseUrl = process.env.PAPERCLIP_API_URL || "http://127.0.0.1:3100";
+    let agent: { id: string; name: string; urlKey?: string } | null = null;
+    try {
+      const res = await fetch(`${baseUrl}/api/agents/${encodeURIComponent(trimmedName.toLowerCase())}?companyId=${resolvedCompanyId}`);
+      if (res.ok) agent = (await res.json()) as typeof agent;
+    } catch {}
+    if (!agent) {
+      try {
+        const res2 = await fetch(`${baseUrl}/api/agents/${encodeURIComponent(trimmedName)}?companyId=${resolvedCompanyId}`);
+        if (res2.ok) agent = (await res2.json()) as typeof agent;
+      } catch {}
+    }
     if (agent) {
-      // Native Paperclip agent - create a session
+      // Agent found — native transport via issue routing (no session API needed)
       agentId = agent.id;
-      const session = await ctx.agents.sessions.create(agentId, resolvedCompanyId, {
-        reason: `Telegram thread ${chatId}/${messageThreadId}`,
-      });
-      sessionId = session.sessionId;
+      sessionId = `native_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       transport = "native";
-      ctx.logger.info("Created native agent session", { agentId, sessionId });
+      ctx.logger.info("Agent matched for native transport", { agentId, sessionId });
     } else {
       sessionId = `acp_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     }
@@ -520,16 +524,16 @@ export async function routeMessageToAgent(
       const baseUrl = process.env.PAPERCLIP_API_URL || "http://127.0.0.1:3100";
 
       if (targetSession.issueId) {
-        // Session already has an issue — add comment
-        await ctx.http.fetch(`${baseUrl}/api/issues/${targetSession.issueId}/comments`, {
+        // Session already has a conversation — add comment via native fetch
+        await fetch(`${baseUrl}/api/issues/${targetSession.issueId}/comments`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ body: text, authorUserId: `telegram:${chatId}` }),
         });
-        ctx.logger.info("Added comment to existing issue", { issueId: targetSession.issueId });
+        ctx.logger.info("Added comment to existing conversation", { issueId: targetSession.issueId });
       } else {
-        // First message — create a conversation (not a task) assigned to agent
-        const issueRes = await ctx.http.fetch(`${baseUrl}/api/companies/${resolvedCompanyId}/issues`, {
+        // First message — create a conversation (not a task) via native fetch
+        const issueRes = await fetch(`${baseUrl}/api/companies/${resolvedCompanyId}/issues`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
@@ -542,7 +546,6 @@ export async function routeMessageToAgent(
           }),
         });
         const issue = (await issueRes.json()) as { id: string; identifier?: string };
-        // Store issue reference in session
         targetSession.issueId = issue.id;
         targetSession.issueIdentifier = issue.identifier;
         const sessionIdx = sessions.findIndex((s) => s.sessionId === targetSession!.sessionId);
@@ -550,14 +553,14 @@ export async function routeMessageToAgent(
           sessions[sessionIdx] = targetSession;
         }
         await saveSessions(ctx, chatId, threadId, sessions);
-        ctx.logger.info("Created Paperclip issue from Telegram", { issueId: issue.id, identifier: issue.identifier });
+        ctx.logger.info("Created Paperclip conversation from Telegram", { issueId: issue.id, identifier: issue.identifier });
         await sendMessage(ctx, token, chatId, escapeMarkdownV2(`📋 ${issue.identifier || "?"} — conversation ouverte`), {
           messageThreadId: threadId,
         });
       }
 
-      // Wake agent to process
-      await ctx.http.fetch(`${baseUrl}/api/agents/${targetSession.agentId}/wakeup`, {
+      // Wake agent to process the conversation
+      await fetch(`${baseUrl}/api/agents/${targetSession.agentId}/wakeup`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
@@ -1280,10 +1283,57 @@ async function saveSessions(
   threadId: number,
   sessions: ChatSession[],
 ): Promise<void> {
+  const key = `sessions_${chatId}_${threadId}`;
   await ctx.state.set(
-    { scopeKind: "instance", stateKey: `sessions_${chatId}_${threadId}` },
+    { scopeKind: "instance", stateKey: key },
     sessions,
   );
+  // Track active session keys for findSessionChatsByIssueId
+  const activeKeys = (await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: "active_session_keys",
+  }) as string[] | null) ?? [];
+  if (!activeKeys.includes(key)) {
+    activeKeys.push(key);
+    await ctx.state.set(
+      { scopeKind: "instance", stateKey: "active_session_keys" },
+      activeKeys,
+    );
+  }
+}
+
+/**
+ * Find all Telegram chat/thread pairs that have an active session linked to the given issueId.
+ * Used by the comment bridge to route agent responses back to Telegram.
+ */
+export async function findSessionChatsByIssueId(
+  ctx: PluginContext,
+  issueId: string,
+): Promise<Array<{ chatId: string; threadId: number }>> {
+  // Scan all session state keys — they follow the pattern sessions_{chatId}_{threadId}
+  // The plugin SDK doesn't have a "list keys" API, so we track active session keys
+  const activeKeys = (await ctx.state.get({
+    scopeKind: "instance",
+    stateKey: "active_session_keys",
+  }) as string[] | null) ?? [];
+
+  const results: Array<{ chatId: string; threadId: number }> = [];
+  for (const key of activeKeys) {
+    const sessions = (await ctx.state.get({
+      scopeKind: "instance",
+      stateKey: key,
+    }) as ChatSession[] | null) ?? [];
+    const match = sessions.find((s) => s.status === "active" && s.issueId === issueId);
+    if (match) {
+      const parts = key.replace("sessions_", "").split("_");
+      const chatId = parts.slice(0, -1).join("_"); // chatId can contain _
+      const threadId = Number(parts[parts.length - 1]);
+      if (chatId && !isNaN(threadId)) {
+        results.push({ chatId, threadId });
+      }
+    }
+  }
+  return results;
 }
 
 async function resolveCompanyIdFromChat(ctx: PluginContext, chatId: string): Promise<string> {
