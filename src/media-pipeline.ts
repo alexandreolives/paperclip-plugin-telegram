@@ -9,6 +9,7 @@ type MediaConfig = {
   briefAgentId: string;
   briefAgentChatIds: string[];
   transcriptionApiKeyRef: string;
+  transcriptionMode?: "openai" | "local" | "off";
   publicUrl?: string;
 };
 
@@ -56,9 +57,12 @@ export async function handleMediaMessage(
   let textContent = msg.caption ?? "";
 
   // Transcribe audio/voice if applicable
-  if (isAudio) {
+  const transcriptionMode = config.transcriptionMode ?? (config.transcriptionApiKeyRef ? "openai" : "local");
+  if (isAudio && transcriptionMode !== "off") {
     try {
-      const transcription = await transcribeAudio(ctx, token, fileId, config.transcriptionApiKeyRef);
+      const transcription = transcriptionMode === "local"
+        ? await transcribeAudioLocal(ctx, token, fileId)
+        : await transcribeAudio(ctx, token, fileId, config.transcriptionApiKeyRef);
       if (transcription) {
         textContent = transcription;
 
@@ -168,38 +172,70 @@ function extractFileId(msg: TelegramMediaMessage): string | null {
   return null;
 }
 
+async function downloadTelegramFile(
+  ctx: PluginContext,
+  botToken: string,
+  fileId: string,
+): Promise<Buffer | null> {
+  const fileRes = await ctx.http.fetch(
+    `${TELEGRAM_API}/bot${botToken}/getFile?file_id=${fileId}`,
+    { method: "GET" },
+  );
+  const fileData = (await fileRes.json()) as { ok: boolean; result?: { file_path?: string } };
+  if (!fileData.ok || !fileData.result?.file_path) {
+    ctx.logger.error("Failed to get file path from Telegram", { fileId });
+    return null;
+  }
+  const downloadUrl = `${TELEGRAM_API}/file/bot${botToken}/${fileData.result.file_path}`;
+  const audioRes = await fetch(downloadUrl);
+  return Buffer.from(await audioRes.arrayBuffer());
+}
+
 async function transcribeAudio(
   ctx: PluginContext,
   botToken: string,
   fileId: string,
-  _transcriptionApiKeyRef: string,
+  transcriptionApiKeyRef: string,
+): Promise<string | null> {
+  const audioBuffer = await downloadTelegramFile(ctx, botToken, fileId);
+  if (!audioBuffer) return null;
+
+  const apiKey = await ctx.secrets.resolve(transcriptionApiKeyRef);
+  const formData = new FormData();
+  formData.append("file", new Blob([audioBuffer], { type: "audio/ogg" }), "audio.ogg");
+  formData.append("model", "whisper-1");
+
+  const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${apiKey}` },
+    body: formData,
+  });
+  const whisperData = (await whisperRes.json()) as { text?: string };
+  return whisperData.text ?? null;
+}
+
+async function transcribeAudioLocal(
+  ctx: PluginContext,
+  botToken: string,
+  fileId: string,
 ): Promise<string | null> {
   const { execSync } = await import("child_process");
   const path = await import("path");
   const os = await import("os");
   const fs = await import("fs");
 
-  // 1. Get file path from Telegram
-  const fileRes = await ctx.http.fetch(`${TELEGRAM_API}/bot${botToken}/getFile?file_id=${fileId}`, { method: "GET" });
-  const fileData = (await fileRes.json()) as { ok: boolean; result?: { file_path?: string } };
-  if (!fileData.ok || !fileData.result?.file_path) {
-    ctx.logger.error("Failed to get file path from Telegram", { fileId });
-    return null;
-  }
+  const audioBuffer = await downloadTelegramFile(ctx, botToken, fileId);
+  if (!audioBuffer) return null;
 
-  // 2. Download audio
-  const downloadUrl = `${TELEGRAM_API}/file/bot${botToken}/${fileData.result.file_path}`;
-  const audioRes = await fetch(downloadUrl);
-  const audioBuffer = Buffer.from(await audioRes.arrayBuffer());
-
-  // 3. Save to temp file
   const tmpDir = os.tmpdir();
   const tmpFile = path.join(tmpDir, `telegram-voice-${Date.now()}.ogg`);
   fs.writeFileSync(tmpFile, audioBuffer);
 
-  // 4. Run whisper CLI locally
   try {
-    execSync(`whisper "${tmpFile}" --model base --language fr --output_format txt --output_dir "${tmpDir}"`, { timeout: 60000 });
+    execSync(
+      `whisper "${tmpFile}" --model base --language fr --output_format txt --output_dir "${tmpDir}"`,
+      { timeout: 60000 },
+    );
     const txtFile = tmpFile.replace(".ogg", ".txt");
     const text = fs.readFileSync(txtFile, "utf8").trim();
     try { fs.unlinkSync(tmpFile); fs.unlinkSync(txtFile); } catch {}
