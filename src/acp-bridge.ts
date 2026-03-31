@@ -19,6 +19,8 @@ export type ChatSession = {
   spawnedAt: string;
   status: "active" | "closed";
   lastActivityAt: string;
+  issueId?: string;
+  issueIdentifier?: string;
 };
 
 type AcpOutputEvent = {
@@ -519,31 +521,49 @@ export async function routeMessageToAgent(
   // Route via correct transport
   if (targetSession.transport === "native") {
     try {
-      await ctx.agents.sessions.sendMessage(targetSession.sessionId, resolvedCompanyId, {
-        prompt: text,
-        reason: "telegram_message",
-        onEvent: (event: AgentSessionEvent) => {
-          if (event.eventType === "chunk" && event.message) {
-            handleAcpOutput(ctx, token, {
-              sessionId: targetSession!.sessionId,
-              chatId,
-              threadId,
-              text: event.message,
-              done: false,
-            }).catch((err) => ctx.logger.error("Native output handler error", { error: String(err) }));
-          } else if (event.eventType === "done") {
-            handleAcpOutput(ctx, token, {
-              sessionId: targetSession!.sessionId,
-              chatId,
-              threadId,
-              text: event.message ?? "",
-              done: true,
-            }).catch((err) => ctx.logger.error("Native output handler error", { error: String(err) }));
-          }
-        },
+      const baseUrl = process.env.PAPERCLIP_API_URL || "http://127.0.0.1:3100";
+
+      if (targetSession.issueId) {
+        // Existing conversation — add comment
+        await fetch(`${baseUrl}/api/issues/${targetSession.issueId}/comments`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ body: text, authorUserId: `telegram:${chatId}` }),
+        });
+        ctx.logger.info("Added comment to conversation", { issueId: targetSession.issueId });
+      } else {
+        // First message — create issue assigned to agent
+        const issueRes = await fetch(`${baseUrl}/api/companies/${resolvedCompanyId}/issues`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            title: `[Telegram] Chat avec ${targetSession.agentDisplayName}`,
+            description: `Conversation initiée depuis Telegram.\n\nPremier message:\n\n${text}`,
+            status: "in_progress",
+            assigneeAgentId: targetSession.agentId,
+            priority: "high",
+          }),
+        });
+        const issue = (await issueRes.json()) as { id: string; identifier?: string };
+        targetSession.issueId = issue.id;
+        targetSession.issueIdentifier = issue.identifier;
+        const sessionIdx = sessions.findIndex((s) => s.sessionId === targetSession!.sessionId);
+        if (sessionIdx >= 0) sessions[sessionIdx] = targetSession;
+        await saveSessions(ctx, chatId, threadId, sessions);
+        ctx.logger.info("Created issue from Telegram", { issueId: issue.id, identifier: issue.identifier });
+        await sendMessage(ctx, token, chatId, escapeMarkdownV2(`📋 ${issue.identifier || "?"} — conversation ouverte`), {
+          messageThreadId: threadId,
+        });
+      }
+
+      // Wake agent
+      await fetch(`${baseUrl}/api/agents/${targetSession.agentId}/wakeup`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "telegram_message", taskId: targetSession.issueId }),
       });
     } catch (err) {
-      ctx.logger.error("Failed to send message to native session", { error: String(err) });
+      ctx.logger.error("Failed to route Telegram message to Paperclip", { error: String(err) });
       return false;
     }
   } else {
