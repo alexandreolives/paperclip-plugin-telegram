@@ -528,14 +528,15 @@ export async function routeMessageToAgent(
         });
         ctx.logger.info("Added comment to existing issue", { issueId: targetSession.issueId });
       } else {
-        // First message — create issue assigned to agent
+        // First message — create a conversation (not a task) assigned to agent
         const issueRes = await ctx.http.fetch(`${baseUrl}/api/companies/${resolvedCompanyId}/issues`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            title: `[Telegram] ${text.slice(0, 80)}${text.length > 80 ? "..." : ""}`,
-            description: `Conversation Telegram avec ${targetSession.agentDisplayName}.\n\nPremier message:\n\n${text}`,
-            status: "todo",
+            kind: "conversation",
+            title: `[Telegram] Chat avec ${targetSession.agentDisplayName}`,
+            description: `Conversation initiée depuis Telegram.\n\nPremier message:\n\n${text}`,
+            status: "in_progress",
             assigneeAgentId: targetSession.agentId,
             priority: "high",
           }),

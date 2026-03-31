@@ -217,6 +217,13 @@ const manifest: PaperclipPluginManifestV1 = {
         description: "Secret UUID for your OpenAI API key used for Whisper transcription. Create the secret in Settings > Secrets, then paste its UUID here.",
         default: DEFAULT_CONFIG.transcriptionApiKeyRef,
       },
+      transcriptionMode: {
+        type: "string",
+        title: "Transcription Mode",
+        description: "How to transcribe voice messages. 'local' uses whisper CLI (no API key needed), 'openai' uses OpenAI API, 'off' disables transcription.",
+        enum: ["local", "openai", "off"],
+        default: "local",
+      },
 
       // --- Proactive watches ---
       maxSuggestionsPerHourPerCompany: {
@@ -278,6 +285,20 @@ const manifest: PaperclipPluginManifestV1 = {
       displayName: "Register Watch",
       description: "Register a proactive watch that monitors entities and sends suggestions",
       parametersSchema: { type: "object" },
+    },
+    {
+      name: "message_agent",
+      displayName: "Message Agent",
+      description: "Send a message to another agent via a Paperclip conversation. Creates a conversation issue if none exists, or adds a comment. Wakes the target agent to respond.",
+      parametersSchema: {
+        type: "object",
+        properties: {
+          targetAgent: { type: "string", description: "Name, urlKey, or role of the target agent" },
+          message: { type: "string", description: "The message to send" },
+          conversationTitle: { type: "string", description: "Optional title for a new conversation (defaults to auto-generated)" },
+        },
+        required: ["targetAgent", "message"],
+      },
     },
   ],
 };
